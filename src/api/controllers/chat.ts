@@ -48,9 +48,11 @@ const FILE_MAX_SIZE = 100 * 1024 * 1024;
  *
  * 在对话流传输完毕后移除会话，避免创建的会话出现在用户的对话列表中
  *
+ * @param convId 会话ID (sessionId)
  * @param ticket tongyi_sso_ticket或login_aliyunid_ticket
  */
 async function removeConversation(convId: string, ticket: string) {
+  logger.info(`[removeConversation] 开始删除会话: ${convId}`);
   const result = await axios.post(
     `https://qianwen.biz.aliyun.com/dialog/session/delete`,
     {
@@ -66,6 +68,7 @@ async function removeConversation(convId: string, ticket: string) {
     }
   );
   checkResult(result);
+  logger.success(`[removeConversation] 会话删除成功: ${convId}`);
 }
 
 /**
@@ -76,13 +79,17 @@ async function removeConversation(convId: string, ticket: string) {
  * @param ticket tongyi_sso_ticket或login_aliyunid_ticket
  * @param refConvId 引用的会话ID
  * @param retryCount 重试次数
+ * @param tools 工具列表
+ * @param toolChoice 工具选择策略
  */
 async function createCompletion(
   model = MODEL_NAME,
   messages: any[],
   ticket: string,
   refConvId = '',
-  retryCount = 0
+  retryCount = 0,
+  tools?: any[],
+  toolChoice?: any
 ) {
   let session: http2.ClientHttp2Session;
   return (async () => {
@@ -100,6 +107,9 @@ async function createCompletion(
     if (!/[0-9a-z]{32}/.test(refConvId))
       refConvId = '';
 
+    // 处理工具调用
+    const hasTools = tools && tools.length > 0;
+
     // 请求流
     const session: http2.ClientHttp2Session = await new Promise(
       (resolve, reject) => {
@@ -108,7 +118,7 @@ async function createCompletion(
         session.on("error", reject);
       }
     );
-    const [sessionId, parentMsgId = ''] = refConvId.split('-');
+    const [refSessionId, parentMsgId = ''] = refConvId.split('-');
     const req = session.request({
       ":method": "POST",
       ":path": "/dialog/conversation",
@@ -125,26 +135,36 @@ async function createCompletion(
         action: "next",
         userAction: "chat",
         requestId: util.uuid(false),
-        sessionId,
+        sessionId: refSessionId,
         sessionType: "text_chat",
         parentMsgId,
         params: {
           "fileUploadBatchId": util.uuid()
         },
-        contents: messagesPrepare(messages, refs, !!refConvId),
+        contents: messagesPrepare(messages, refs, !!refConvId, tools),
       })
     );
     req.setEncoding("utf8");
     const streamStartTime = util.timestamp();
     // 接收流为输出文本
-    const answer = await receiveStream(req);
+    const answer = await receiveStream(req, hasTools);
     session.close();
     logger.success(
       `Stream has completed transfer ${util.timestamp() - streamStartTime}ms`
     );
 
+    // 如果是临时创建的会话（非引用会话），则删除
     // 异步移除会话，如果消息不合规，此操作可能会抛出数据库错误异常，请忽略
-    removeConversation(answer.id, ticket).catch((err) => console.error(err));
+    if (!refSessionId) {
+      // answer.id 格式为 "sessionId-messageId"，需要提取 sessionId
+      const sessionId = answer.id.split('-')[0];
+      logger.info(`[会话清理] 准备删除临时会话: ${sessionId}`);
+      removeConversation(sessionId, ticket).catch((err) => {
+        logger.error(`[会话清理] 删除会话失败: ${sessionId}`, err);
+      });
+    } else {
+      logger.info(`[会话清理] 保留引用会话: ${refSessionId}`);
+    }
 
     return answer;
   })().catch((err) => {
@@ -154,7 +174,7 @@ async function createCompletion(
       logger.warn(`Try again after ${RETRY_DELAY / 1000}s...`);
       return (async () => {
         await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY));
-        return createCompletion(model, messages, ticket, refConvId, retryCount + 1);
+        return createCompletion(model, messages, ticket, refConvId, retryCount + 1, tools, toolChoice);
       })();
     }
     throw err;
@@ -169,18 +189,116 @@ async function createCompletion(
  * @param ticket tongyi_sso_ticket或login_aliyunid_ticket
  * @param refConvId 引用的会话ID
  * @param retryCount 重试次数
+ * @param tools 工具列表
+ * @param toolChoice 工具选择策略
  */
 async function createCompletionStream(
   model = MODEL_NAME,
   messages: any[],
   ticket: string,
   refConvId = '',
-  retryCount = 0
+  retryCount = 0,
+  tools?: any[],
+  toolChoice?: any
 ) {
   let session: http2.ClientHttp2Session;
   return (async () => {
     logger.info(messages);
 
+    // 处理工具调用：如果有工具定义，先用非流式获取完整响应，再模拟流式输出
+    const hasTools = tools && tools.length > 0;
+    if (hasTools) {
+      logger.info('[流式工具调用] 检测到工具定义，使用非流式模式获取响应后模拟流式输出');
+      
+      // 调用非流式接口获取完整响应
+      const completion = await createCompletion(model, messages, ticket, refConvId, retryCount, tools, toolChoice);
+      
+      // 创建模拟的流式响应
+      const transStream = new PassThrough();
+      const created = util.unixTimestamp();
+      
+      // 发送初始消息
+      transStream.write(`data: ${JSON.stringify({
+        id: completion.id,
+        model: completion.model,
+        object: "chat.completion.chunk",
+        choices: [{
+          index: 0,
+          delta: { role: "assistant", content: "" },
+          finish_reason: null
+        }],
+        created
+      })}\n\n`);
+      
+      const choice = completion.choices[0];
+      
+      // 如果有工具调用，发送工具调用信息
+      if (choice.message.tool_calls && choice.message.tool_calls.length > 0) {
+        for (const toolCall of choice.message.tool_calls) {
+          transStream.write(`data: ${JSON.stringify({
+            id: completion.id,
+            model: completion.model,
+            object: "chat.completion.chunk",
+            choices: [{
+              index: 0,
+              delta: {
+                tool_calls: [{
+                  index: 0,
+                  id: toolCall.id,
+                  type: toolCall.type,
+                  function: {
+                    name: toolCall.function.name,
+                    arguments: toolCall.function.arguments
+                  }
+                }]
+              },
+              finish_reason: null
+            }],
+            created
+          })}\n\n`);
+        }
+      }
+      
+      // 如果有内容，分块发送（模拟打字效果）
+      if (choice.message.content) {
+        const content = choice.message.content;
+        const chunkSize = 5; // 每次发送5个字符
+        for (let i = 0; i < content.length; i += chunkSize) {
+          const chunk = content.substring(i, i + chunkSize);
+          transStream.write(`data: ${JSON.stringify({
+            id: completion.id,
+            model: completion.model,
+            object: "chat.completion.chunk",
+            choices: [{
+              index: 0,
+              delta: { content: chunk },
+              finish_reason: null
+            }],
+            created
+          })}\n\n`);
+        }
+      }
+      
+      // 发送结束标记
+      transStream.write(`data: ${JSON.stringify({
+        id: completion.id,
+        model: completion.model,
+        object: "chat.completion.chunk",
+        choices: [{
+          index: 0,
+          delta: {},
+          finish_reason: choice.finish_reason
+        }],
+        created
+      })}\n\n`);
+      
+      transStream.end("data: [DONE]\n\n");
+      
+      logger.success('[流式工具调用] 模拟流式输出完成');
+      return transStream;
+    }
+
+    // 原有的流式处理逻辑（无工具调用时）
     // 提取引用文件URL并上传qwen获得引用的文件ID列表
     const refFileUrls = extractRefFileUrls(messages);
     const refs = refFileUrls.length
@@ -199,7 +317,7 @@ async function createCompletionStream(
       session.on("connect", () => resolve(session));
       session.on("error", reject);
     });
-    const [sessionId, parentMsgId = ''] = refConvId.split('-');
+    const [refSessionId, parentMsgId = ''] = refConvId.split('-');
     const req = session.request({
       ":method": "POST",
       ":path": "/dialog/conversation",
@@ -216,26 +334,34 @@ async function createCompletionStream(
         action: "next",
         userAction: "chat",
         requestId: util.uuid(false),
-        sessionId,
+        sessionId: refSessionId,
         sessionType: "text_chat",
         parentMsgId,
         params: {
           "fileUploadBatchId": util.uuid()
         },
-        contents: messagesPrepare(messages, refs, !!refConvId),
+        contents: messagesPrepare(messages, refs, !!refConvId, tools),
       })
     );
     req.setEncoding("utf8");
     const streamStartTime = util.timestamp();
     // 创建转换流将消息格式转换为gpt兼容格式
-    return createTransStream(req, (convId: string) => {
+    return createTransStream(req, hasTools, (convId: string) => {
       // 关闭请求会话
       session.close();
       logger.success(
         `Stream has completed transfer ${util.timestamp() - streamStartTime}ms`
       );
+      // 如果是临时创建的会话（非引用会话），则删除
       // 流传输结束后异步移除会话，如果消息不合规，此操作可能会抛出数据库错误异常，请忽略
-      removeConversation(convId, ticket).catch((err) => console.error(err));
+      if (!refSessionId) {
+        logger.info(`[会话清理] 准备删除临时会话: ${convId}`);
+        removeConversation(convId, ticket).catch((err) => {
+          logger.error(`[会话清理] 删除会话失败: ${convId}`, err);
+        });
+      } else {
+        logger.info(`[会话清理] 保留引用会话: ${refSessionId}`);
+      }
     });
   })().catch((err) => {
     session && session.close();
@@ -244,7 +370,7 @@ async function createCompletionStream(
       logger.warn(`Try again after ${RETRY_DELAY / 1000}s...`);
       return (async () => {
         await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY));
-        return createCompletionStream(model, messages, ticket, refConvId, retryCount + 1);
+        return createCompletionStream(model, messages, ticket, refConvId, retryCount + 1, tools, toolChoice);
       })();
     }
     throw err;
@@ -323,6 +449,56 @@ async function generateImages(
 }
 
 /**
+ * 解析文本中的工具调用
+ * 
+ * @param text 文本内容
+ * @returns 解析结果 { toolCalls: 工具调用数组, cleanedText: 清理后的文本 }
+ */
+function parseToolCallsFromText(text: string): { toolCalls: any[], cleanedText: string } {
+  const toolCalls: any[] = [];
+  let cleanedText = text;
+  
+  logger.info(`[parseToolCallsFromText] 输入文本: ${text.substring(0, 200)}`);
+  
+  // 匹配 TOOL_CALL: 后面的 JSON 对象（支持嵌套）
+  const toolCallPattern = /TOOL_CALL:\s*(\{(?:[^{}]|\{[^{}]*\})*\})/g;
+  let match;
+  
+  while ((match = toolCallPattern.exec(text)) !== null) {
+    logger.info(`[parseToolCallsFromText] 找到匹配: ${match[0]}`);
+    try {
+      const jsonStr = match[1];
+      logger.info(`[parseToolCallsFromText] 尝试解析 JSON: ${jsonStr}`);
+      const toolCallData = JSON.parse(jsonStr);
+      logger.info(`[parseToolCallsFromText] JSON 解析成功: ${JSON.stringify(toolCallData)}`);
+      if (toolCallData.name && toolCallData.arguments !== undefined) {
+        toolCalls.push({
+          id: `call_${util.uuid(false)}`,
+          type: 'function',
+          function: {
+            name: toolCallData.name,
+            arguments: typeof toolCallData.arguments === 'string' 
+              ? toolCallData.arguments 
+              : JSON.stringify(toolCallData.arguments)
+          }
+        });
+        // 从文本中移除工具调用标记
+        cleanedText = cleanedText.replace(match[0], '').trim();
+        logger.info(`[parseToolCallsFromText] 成功添加工具调用: ${toolCallData.name}`);
+      } else {
+        logger.warn(`[parseToolCallsFromText] 工具调用数据不完整: name=${toolCallData.name}, arguments=${toolCallData.arguments}`);
+      }
+    } catch (err) {
+      logger.warn(`解析工具调用失败: ${match[1]}`, err);
+    }
+  }
+  
+  logger.info(`[parseToolCallsFromText] 总共解析出 ${toolCalls.length} 个工具调用`);
+  
+  return { toolCalls, cleanedText };
+}
+
+/**
  * 提取消息中引用的文件URL
  *
  * @param messages 参考gpt系列消息格式，多轮对话请完整提供上下文
@@ -369,8 +545,9 @@ function extractRefFileUrls(messages: any[]) {
  * @param messages 参考gpt系列消息格式，多轮对话请完整提供上下文
  * @param refs 参考文件列表
  * @param isRefConv 是否为引用会话
+ * @param tools 工具列表
  */
-function messagesPrepare(messages: any[], refs: any[] = [], isRefConv = false) {
+function messagesPrepare(messages: any[], refs: any[] = [], isRefConv = false, tools?: any[]) {
   let content;
   if (isRefConv || messages.length < 2) {
     content = messages.reduce((content, message) => {
@@ -400,6 +577,40 @@ function messagesPrepare(messages: any[], refs: any[] = [], isRefConv = false) {
     }, "").replace(/\!\[.*\]\(.+\)/g, "");
     logger.info("\n对话合并：\n" + content);
   }
+
+  // 如果有工具定义，添加工具调用指令
+  if (tools && tools.length > 0) {
+    const toolDescriptions = tools.map(tool => {
+      const func = tool.function;
+      const params = func.parameters?.properties || {};
+      const required = func.parameters?.required || [];
+      
+      const paramDesc = Object.keys(params).map(key => {
+        const param = params[key];
+        const isRequired = required.includes(key);
+        return `  - ${key}${isRequired ? ' (必需)' : ' (可选)'}: ${param.type} - ${param.description || ''}`;
+      }).join('\n');
+      
+      return `- ${func.name}: ${func.description || ''}\n${paramDesc ? '  参数:\n' + paramDesc : ''}`;
+    }).join('\n\n');
+
+    const toolInstruction = `\n\n[系统指令] 你可以使用以下工具来帮助回答用户问题：
+
+${toolDescriptions}
+
+当你需要调用工具时，请严格按照以下JSON格式输出（必须在单独一行）：
+TOOL_CALL: {"name": "工具名称", "arguments": {"参数名": "参数值"}}
+
+注意：
+1. TOOL_CALL 必须独占一行
+2. JSON 必须是有效的格式
+3. 调用工具后，等待工具返回结果再继续回答
+4. 如果不需要调用工具，直接正常回答即可
+
+`;
+    content = content + toolInstruction;
+  }
+
   return [
     {
       content,
@@ -429,8 +640,9 @@ function checkResult(result: AxiosResponse) {
  * 从流接收完整的消息内容
  *
  * @param stream 消息流
+ * @param hasTools 是否有工具调用
  */
-async function receiveStream(stream: any): Promise<any> {
+async function receiveStream(stream: any, hasTools = false): Promise<any> {
   return new Promise((resolve, reject) => {
     // 消息初始化
     const data = {
@@ -440,13 +652,21 @@ async function receiveStream(stream: any): Promise<any> {
       choices: [
         {
           index: 0,
-          message: { role: "assistant", content: "" },
+          message: { 
+            role: "assistant", 
+            content: "",
+            tool_calls: undefined as any[] | undefined
+          },
           finish_reason: "stop",
         },
       ],
       usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
       created: util.unixTimestamp(),
     };
+    
+    // 工具调用相关
+    let toolCalls: any[] = [];
+    
     const parser = createParser((event) => {
       try {
         if (event.type !== "event") return;
@@ -490,6 +710,33 @@ async function receiveStream(stream: any): Promise<any> {
               "\n[内容由于不合规被停止生成，我们换个话题吧]";
           if (result.errorCode)
             data.choices[0].message.content += `服务暂时不可用，第三方响应错误：${result.errorCode}`;
+          
+          let finalContent = data.choices[0].message.content;
+          
+          logger.info(`[工具调用] hasTools: ${hasTools}, toolCalls.length: ${toolCalls.length}`);
+          logger.info(`[工具调用] finalContent: ${finalContent.substring(0, 200)}`);
+          
+          // 如果启用了工具调用，尝试从文本中解析工具调用
+          if (hasTools && toolCalls.length === 0) {
+            logger.info('[工具调用] 开始解析文本中的工具调用');
+            const parsed = parseToolCallsFromText(finalContent);
+            logger.info(`[工具调用] 解析结果: ${parsed.toolCalls.length} 个工具调用`);
+            if (parsed.toolCalls.length > 0) {
+              logger.info(`[工具调用] 工具调用详情: ${JSON.stringify(parsed.toolCalls)}`);
+              toolCalls = parsed.toolCalls;
+              finalContent = parsed.cleanedText;
+            }
+          }
+          
+          data.choices[0].message.content = finalContent;
+          
+          // 添加工具调用到消息中
+          if (toolCalls.length > 0) {
+            data.choices[0].message.tool_calls = toolCalls;
+            data.choices[0].finish_reason = 'tool_calls';
+            logger.success('[工具调用] 成功设置 tool_calls');
+          }
+          
           resolve(data);
         }
       } catch (err) {
@@ -500,7 +747,24 @@ async function receiveStream(stream: any): Promise<any> {
     // 将流数据喂给SSE转换器
     stream.on("data", (buffer) => parser.feed(buffer.toString()));
     stream.once("error", (err) => reject(err));
-    stream.once("close", () => resolve(data));
+    stream.once("close", () => {
+      // 流结束时，如果启用了工具调用，尝试从文本中解析
+      if (hasTools && toolCalls.length === 0) {
+        logger.info(`[工具调用] 流结束，开始解析文本中的工具调用`);
+        logger.info(`[工具调用] 最终内容: ${data.choices[0].message.content.substring(0, 300)}`);
+        const parsed = parseToolCallsFromText(data.choices[0].message.content);
+        if (parsed.toolCalls.length > 0) {
+          logger.success(`[工具调用] 成功解析 ${parsed.toolCalls.length} 个工具调用`);
+          toolCalls = parsed.toolCalls;
+          data.choices[0].message.content = parsed.cleanedText;
+          data.choices[0].message.tool_calls = toolCalls;
+          data.choices[0].finish_reason = 'tool_calls';
+        } else {
+          logger.warn(`[工具调用] 未能解析出工具调用`);
+        }
+      }
+      resolve(data);
+    });
     stream.end();
   });
 }
@@ -511,14 +775,20 @@ async function receiveStream(stream: any): Promise<any> {
  * 将流格式转换为gpt兼容流格式
  *
  * @param stream 消息流
+ * @param hasTools 是否有工具调用
  * @param endCallback 传输结束回调
  */
-function createTransStream(stream: any, endCallback?: Function) {
+function createTransStream(stream: any, hasTools = false, endCallback?: Function) {
   // 消息创建时间
   const created = util.unixTimestamp();
   // 创建转换流
   const transStream = new PassThrough();
   let content = "";
+  
+  // 工具调用相关
+  let toolCalls: any[] = [];
+  let accumulatedContent = ''; // 累积的内容，用于解析工具调用
+  
   !transStream.closed &&
     transStream.write(
       `data: ${JSON.stringify({
@@ -569,6 +839,64 @@ function createTransStream(stream: any, endCallback?: Function) {
       if (result.msgStatus != "finished") {
         if (chunk && result.contentType == "text") {
           content += chunk;
+          
+          // 累积内容用于工具调用检测
+          if (hasTools) {
+            accumulatedContent += chunk;
+            
+            // 检查是否包含完整的工具调用（支持嵌套 JSON）
+            const toolCallMatch = accumulatedContent.match(/TOOL_CALL:\s*(\{(?:[^{}]|\{[^{}]*\})*\})/);
+            if (toolCallMatch) {
+              try {
+                const toolCallData = JSON.parse(toolCallMatch[1]);
+                if (toolCallData.name && toolCallData.arguments !== undefined) {
+                  const toolCall = {
+                    id: `call_${util.uuid(false)}`,
+                    type: 'function',
+                    function: {
+                      name: toolCallData.name,
+                      arguments: typeof toolCallData.arguments === 'string' 
+                        ? toolCallData.arguments 
+                        : JSON.stringify(toolCallData.arguments)
+                    }
+                  };
+                  toolCalls.push(toolCall);
+                  
+                  // 发送工具调用
+                  transStream.write(`data: ${JSON.stringify({
+                    id: `${result.sessionId}-${result.msgId}`,
+                    model: MODEL_NAME,
+                    object: "chat.completion.chunk",
+                    choices: [
+                      {
+                        index: 0,
+                        delta: {
+                          tool_calls: [{
+                            index: toolCalls.length - 1,
+                            id: toolCall.id,
+                            type: 'function',
+                            function: {
+                              name: toolCall.function.name,
+                              arguments: toolCall.function.arguments
+                            }
+                          }]
+                        },
+                        finish_reason: null,
+                      },
+                    ],
+                    created,
+                  })}\n\n`);
+                  
+                  // 清除已处理的工具调用部分
+                  accumulatedContent = accumulatedContent.replace(toolCallMatch[0], '').trim();
+                  return; // 不发送包含 TOOL_CALL 的内容
+                }
+              } catch (err) {
+                // JSON 解析失败，继续累积
+              }
+            }
+          }
+          
           const data = `data: ${JSON.stringify({
             id: `${result.sessionId}-${result.msgId}`,
             model: MODEL_NAME,
@@ -581,6 +909,61 @@ function createTransStream(stream: any, endCallback?: Function) {
           !transStream.closed && transStream.write(data);
         }
       } else {
+        // 在流式响应结束时，如果还有累积的内容未解析，尝试解析工具调用
+        if (hasTools && toolCalls.length === 0 && accumulatedContent.trim()) {
+          logger.info(`[流式工具调用] 结束时检查累积内容: ${accumulatedContent.substring(0, 200)}`);
+          const toolCallMatch = accumulatedContent.match(/TOOL_CALL:\s*(\{(?:[^{}]|\{[^{}]*\})*\})/);
+          if (toolCallMatch) {
+            try {
+              const toolCallData = JSON.parse(toolCallMatch[1]);
+              if (toolCallData.name && toolCallData.arguments !== undefined) {
+                const toolCall = {
+                  id: `call_${util.uuid(false)}`,
+                  type: 'function',
+                  function: {
+                    name: toolCallData.name,
+                    arguments: typeof toolCallData.arguments === 'string' 
+                      ? toolCallData.arguments 
+                      : JSON.stringify(toolCallData.arguments)
+                  }
+                };
+                toolCalls.push(toolCall);
+                logger.success(`[流式工具调用] 在结束时成功解析工具调用: ${toolCallData.name}`);
+                
+                // 发送工具调用
+                transStream.write(`data: ${JSON.stringify({
+                  id: `${result.sessionId}-${result.msgId}`,
+                  model: MODEL_NAME,
+                  object: "chat.completion.chunk",
+                  choices: [
+                    {
+                      index: 0,
+                      delta: {
+                        tool_calls: [{
+                          index: 0,
+                          id: toolCall.id,
+                          type: 'function',
+                          function: {
+                            name: toolCall.function.name,
+                            arguments: toolCall.function.arguments
+                          }
+                        }]
+                      },
+                      finish_reason: null,
+                    },
+                  ],
+                  created,
+                })}\n\n`);
+              }
+            } catch (err) {
+              logger.warn(`[流式工具调用] 结束时解析失败: ${err.message}`);
+            }
+          }
+        }
+        
+        const finishReason = toolCalls.length > 0 ? 'tool_calls' : 'stop';
+        logger.info(`[流式工具调用] 发送结束标记, finishReason: ${finishReason}, toolCalls: ${toolCalls.length}`);
+        
         const delta = { content: chunk || "" };
         if (!result.canShare)
           delta.content += "\n[内容由于不合规被停止生成，我们换个话题吧]";
@@ -594,7 +977,7 @@ function createTransStream(stream: any, endCallback?: Function) {
             {
               index: 0,
               delta,
-              finish_reason: "stop",
+              finish_reason: finishReason,
             },
           ],
           usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },

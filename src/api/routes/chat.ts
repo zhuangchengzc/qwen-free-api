@@ -17,13 +17,16 @@ export default {
       const tokens = chat.tokenSplit(request.headers.authorization);
       // 随机挑选一个ticket
       const token = _.sample(tokens);
-      const { model, conversation_id: convId, messages, stream } = request.body;
+      const { model, conversation_id: convId, messages, stream, tools, tool_choice: toolChoice } = request.body;
       if (stream) {
         const stream = await chat.createCompletionStream(
           model,
           messages,
           token,
-          convId
+          convId,
+          0,
+          tools,
+          toolChoice
         );
         return new Response(stream, {
           type: "text/event-stream",
@@ -33,7 +36,10 @@ export default {
           model,
           messages,
           token,
-          convId
+          convId,
+          0,
+          tools,
+          toolChoice
         );
     },
   },
