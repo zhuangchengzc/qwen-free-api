@@ -221,7 +221,7 @@ async function createCompletionStream(
       if (!hasActualToolCalls && !choice.message.content) {
         // 模型返回空响应，可能是拒绝回答或其他原因，走正常流式
         logger.warn('[流式工具调用] 模型返回空响应，切换到正常流式处理');
-        // 继续执行下面的正常流式逻辑
+        // 继续执行下面的正常流式逻辑/*  */
       } else {
         // 创建模拟的流式响应
         const transStream = new PassThrough();
@@ -469,19 +469,75 @@ function parseToolCallsFromText(text: string): { toolCalls: any[], cleanedText: 
   const toolCalls: any[] = [];
   let cleanedText = text;
   
-  logger.info(`[parseToolCallsFromText] 输入文本: ${text.substring(0, 200)}`);
+  logger.info(`[parseToolCallsFromText] 输入文本长度: ${text.length}, 前200字符: ${text.substring(0, 200)}`);
   
-  // 匹配 TOOL_CALL: 后面的 JSON 对象（支持嵌套）
-  const toolCallPattern = /TOOL_CALL:\s*(\{(?:[^{}]|\{[^{}]*\})*\})/g;
-  let match;
+  // 使用括号计数法查找所有 TOOL_CALL: 的位置（支持任意深度嵌套）
+  const toolCallPrefix = 'TOOL_CALL:';
+  let startIndex = 0;
   
-  while ((match = toolCallPattern.exec(text)) !== null) {
-    logger.info(`[parseToolCallsFromText] 找到匹配: ${match[0]}`);
+  while ((startIndex = text.indexOf(toolCallPrefix, startIndex)) !== -1) {
+    // 跳过 "TOOL_CALL:" 前缀
+    let jsonStart = startIndex + toolCallPrefix.length;
+    
+    // 跳过空白字符
+    while (jsonStart < text.length && /\s/.test(text[jsonStart])) {
+      jsonStart++;
+    }
+    
+    // 确保是 JSON 对象开始
+    if (jsonStart >= text.length || text[jsonStart] !== '{') {
+      startIndex = jsonStart;
+      continue;
+    }
+    
+    // 使用括号计数法找到完整的 JSON 对象
+    let braceCount = 0;
+    let jsonEnd = jsonStart;
+    let inString = false;
+    let escapeNext = false;
+    
+    for (let i = jsonStart; i < text.length; i++) {
+      const char = text[i];
+      
+      if (escapeNext) {
+        escapeNext = false;
+        continue;
+      }
+      
+      if (char === '\\') {
+        escapeNext = true;
+        continue;
+      }
+      
+      if (char === '"') {
+        inString = !inString;
+        continue;
+      }
+      
+      if (!inString) {
+        if (char === '{') {
+          braceCount++;
+        } else if (char === '}') {
+          braceCount--;
+          if (braceCount === 0) {
+            jsonEnd = i + 1;
+            break;
+          }
+        }
+      }
+    }
+    
+    // 提取 JSON 字符串
+    const jsonStr = text.substring(jsonStart, jsonEnd);
+    const fullMatch = text.substring(startIndex, jsonEnd);
+    
+    logger.info(`[parseToolCallsFromText] 找到匹配，长度: ${fullMatch.length}, 前100字符: ${fullMatch.substring(0, 100)}...`);
+    
     try {
-      const jsonStr = match[1];
-      logger.info(`[parseToolCallsFromText] 尝试解析 JSON: ${jsonStr}`);
+      logger.info(`[parseToolCallsFromText] 尝试解析 JSON (长度: ${jsonStr.length})`);
       const toolCallData = JSON.parse(jsonStr);
-      logger.info(`[parseToolCallsFromText] JSON 解析成功: ${JSON.stringify(toolCallData)}`);
+      logger.info(`[parseToolCallsFromText] JSON 解析成功: ${JSON.stringify(toolCallData).substring(0, 200)}`);
+      
       if (toolCallData.name && toolCallData.arguments !== undefined) {
         toolCalls.push({
           id: `call_${util.uuid(false)}`,
@@ -494,14 +550,18 @@ function parseToolCallsFromText(text: string): { toolCalls: any[], cleanedText: 
           }
         });
         // 从文本中移除工具调用标记
-        cleanedText = cleanedText.replace(match[0], '').trim();
+        cleanedText = cleanedText.replace(fullMatch, '').trim();
         logger.info(`[parseToolCallsFromText] 成功添加工具调用: ${toolCallData.name}`);
       } else {
         logger.warn(`[parseToolCallsFromText] 工具调用数据不完整: name=${toolCallData.name}, arguments=${toolCallData.arguments}`);
       }
     } catch (err) {
-      logger.warn(`解析工具调用失败: ${match[1]}`, err);
+      logger.error(`[parseToolCallsFromText] JSON 解析失败: ${err.message}`);
+      logger.error(`[parseToolCallsFromText] 失败的 JSON (长度: ${jsonStr.length}): ${jsonStr.substring(0, 200)}`);
     }
+    
+    // 移动到下一个可能的位置
+    startIndex = jsonEnd > startIndex ? jsonEnd : startIndex + 1;
   }
   
   logger.info(`[parseToolCallsFromText] 总共解析出 ${toolCalls.length} 个工具调用`);
