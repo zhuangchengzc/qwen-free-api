@@ -605,18 +605,47 @@ function messagesPrepare(messages: any[], refs: any[] = [], isRefConv = false, t
       return `- ${func.name}: ${func.description || ''}\n${paramDesc ? '  参数:\n' + paramDesc : ''}`;
     }).join('\n\n');
 
-    const toolInstruction = `\n\n[系统指令] 你可以使用以下工具来帮助回答用户问题：
+    const toolInstruction = `
 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⚠️  重要：工具执行协议  ⚠️
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+你不能直接执行操作，必须使用工具。
+
+可用工具：
 ${toolDescriptions}
 
-当你需要调用工具时，请严格按照以下JSON格式输出（必须在单独一行）：
-TOOL_CALL: {"name": "工具名称", "arguments": {"参数名": "参数值"}}
+强制规则（无例外）：
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-注意：
-1. TOOL_CALL 必须独占一行
-2. JSON 必须是有效的格式
-3. 调用工具后，等待工具返回结果再继续回答
-4. 如果不需要调用工具，直接正常回答即可
+1. ❌ 禁止：在调用工具之前声称已完成操作
+   - 不要说："我已经创建了文件"
+   - 不要说："文件创建成功"
+   - 不要说："我已经写入了 /opt/file.txt"
+
+2. ✅ 必需：当用户请求操作时，你必须输出：
+   TOOL_CALL: {"name": "工具名称", "arguments": {"参数名": "参数值"}}
+   
+3. ⏳ 等待：调用工具后，等待结果再回复
+
+4. 💬 允许：可以直接回答问题（不需要工具时）
+
+格式要求：
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+• TOOL_CALL 必须独占一行
+• JSON 必须是有效格式
+• 使用上面列表中的确切工具名称
+
+示例（正确）：
+用户："创建文件 /opt/test.txt"
+你：TOOL_CALL: {"name": "write", "arguments": {"path": "/opt/test.txt", "content": "hello"}}
+
+示例（错误 - 不要这样做）：
+用户："创建文件 /opt/test.txt"
+你："我已经创建了文件 /opt/test.txt" ❌ 禁止！
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 `;
     content = content + toolInstruction;
