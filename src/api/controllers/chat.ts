@@ -213,89 +213,100 @@ async function createCompletionStream(
       // 调用非流式接口获取完整响应
       const completion = await createCompletion(model, messages, ticket, refConvId, retryCount, tools, toolChoice);
       
-      // 创建模拟的流式响应
-      const transStream = new PassThrough();
-      const created = util.unixTimestamp();
-      
-      // 发送初始消息
-      transStream.write(`data: ${JSON.stringify({
-        id: completion.id,
-        model: completion.model,
-        object: "chat.completion.chunk",
-        choices: [{
-          index: 0,
-          delta: { role: "assistant", content: "" },
-          finish_reason: null
-        }],
-        created
-      })}\n\n`);
-      
       const choice = completion.choices[0];
       
-      // 如果有工具调用，发送工具调用信息
-      if (choice.message.tool_calls && choice.message.tool_calls.length > 0) {
-        for (const toolCall of choice.message.tool_calls) {
-          transStream.write(`data: ${JSON.stringify({
-            id: completion.id,
-            model: completion.model,
-            object: "chat.completion.chunk",
-            choices: [{
-              index: 0,
-              delta: {
-                tool_calls: [{
-                  index: 0,
-                  id: toolCall.id,
-                  type: toolCall.type,
-                  function: {
-                    name: toolCall.function.name,
-                    arguments: toolCall.function.arguments
-                  }
-                }]
-              },
-              finish_reason: null
-            }],
-            created
-          })}\n\n`);
+      // 检查是否真的有工具调用
+      const hasActualToolCalls = choice.message.tool_calls && choice.message.tool_calls.length > 0;
+      
+      if (!hasActualToolCalls && !choice.message.content) {
+        // 模型返回空响应，可能是拒绝回答或其他原因，走正常流式
+        logger.warn('[流式工具调用] 模型返回空响应，切换到正常流式处理');
+        // 继续执行下面的正常流式逻辑
+      } else {
+        // 创建模拟的流式响应
+        const transStream = new PassThrough();
+        const created = util.unixTimestamp();
+        
+        // 发送初始消息
+        transStream.write(`data: ${JSON.stringify({
+          id: completion.id,
+          model: completion.model,
+          object: "chat.completion.chunk",
+          choices: [{
+            index: 0,
+            delta: { role: "assistant", content: "" },
+            finish_reason: null
+          }],
+          created
+        })}\n\n`);
+        
+        const choice = completion.choices[0];
+        
+        // 如果有工具调用，发送工具调用信息
+        if (choice.message.tool_calls && choice.message.tool_calls.length > 0) {
+          for (const toolCall of choice.message.tool_calls) {
+            transStream.write(`data: ${JSON.stringify({
+              id: completion.id,
+              model: completion.model,
+              object: "chat.completion.chunk",
+              choices: [{
+                index: 0,
+                delta: {
+                  tool_calls: [{
+                    index: 0,
+                    id: toolCall.id,
+                    type: toolCall.type,
+                    function: {
+                      name: toolCall.function.name,
+                      arguments: toolCall.function.arguments
+                    }
+                  }]
+                },
+                finish_reason: null
+              }],
+              created
+            })}\n\n`);
+          }
         }
-      }
-      
-      // 如果有内容，分块发送（模拟打字效果）
-      if (choice.message.content) {
-        const content = choice.message.content;
-        const chunkSize = 5; // 每次发送5个字符
-        for (let i = 0; i < content.length; i += chunkSize) {
-          const chunk = content.substring(i, i + chunkSize);
-          transStream.write(`data: ${JSON.stringify({
-            id: completion.id,
-            model: completion.model,
-            object: "chat.completion.chunk",
-            choices: [{
-              index: 0,
-              delta: { content: chunk },
-              finish_reason: null
-            }],
-            created
-          })}\n\n`);
+        
+        // 如果有内容，分块发送（模拟打字效果）
+        if (choice.message.content) {
+          const content = choice.message.content;
+          const chunkSize = 5; // 每次发送5个字符
+          for (let i = 0; i < content.length; i += chunkSize) {
+            const chunk = content.substring(i, i + chunkSize);
+            transStream.write(`data: ${JSON.stringify({
+              id: completion.id,
+              model: completion.model,
+              object: "chat.completion.chunk",
+              choices: [{
+                index: 0,
+                delta: { content: chunk },
+                finish_reason: null
+              }],
+              created
+            })}\n\n`);
+          }
         }
+        
+        // 发送结束标记
+        transStream.write(`data: ${JSON.stringify({
+          id: completion.id,
+          model: completion.model,
+          object: "chat.completion.chunk",
+          choices: [{
+            index: 0,
+            delta: {},
+            finish_reason: choice.finish_reason
+          }],
+          created
+        })}\n\n`);
+        
+        transStream.end("data: [DONE]\n\n");
+        
+        logger.success('[流式工具调用] 模拟流式输出完成');
+        return transStream;
       }
-      
-      // 发送结束标记
-      transStream.write(`data: ${JSON.stringify({
-        id: completion.id,
-        model: completion.model,
-        object: "chat.completion.chunk",
-        choices: [{
-          index: 0,
-          delta: {},
-          finish_reason: choice.finish_reason
-        }],
-        created
-      })}\n\n`);
-      
-      transStream.end("data: [DONE]\n\n");
-      
-      logger.success('[流式工具调用] 模拟流式输出完成');
-      return transStream;
     }
 
     // 原有的流式处理逻辑（无工具调用时）
@@ -671,6 +682,8 @@ async function receiveStream(stream: any, hasTools = false): Promise<any> {
       try {
         if (event.type !== "event") return;
         if (event.data == "[DONE]") return;
+        // 过滤心跳消息
+        if (event.data == "[heartbeat]") return;
         // 解析JSON
         const result = _.attempt(() => JSON.parse(event.data));
         if (_.isError(result))
@@ -809,6 +822,8 @@ function createTransStream(stream: any, hasTools = false, endCallback?: Function
     try {
       if (event.type !== "event") return;
       if (event.data == "[DONE]") return;
+      // 过滤心跳消息
+      if (event.data == "[heartbeat]") return;
       // 解析JSON
       const result = _.attempt(() => JSON.parse(event.data));
       if (_.isError(result))
@@ -1024,6 +1039,8 @@ async function receiveImages(
       try {
         if (event.type !== "event") return;
         if (event.data == "[DONE]") return;
+        // 过滤心跳消息
+        if (event.data == "[heartbeat]") return;
         // 解析JSON
         const result = _.attempt(() => JSON.parse(event.data));
         if (_.isError(result))
