@@ -131,7 +131,7 @@ async function createCompletion(
     req.write(
       JSON.stringify({
         mode: "chat",
-        model: "",
+        model: model,
         action: "next",
         userAction: "chat",
         requestId: util.uuid(false),
@@ -147,7 +147,7 @@ async function createCompletion(
     req.setEncoding("utf8");
     const streamStartTime = util.timestamp();
     // 接收流为输出文本
-    const answer = await receiveStream(req, hasTools);
+    const answer = await receiveStream(req, hasTools, model);
     session.close();
     logger.success(
       `Stream has completed transfer ${util.timestamp() - streamStartTime}ms`
@@ -341,7 +341,7 @@ async function createCompletionStream(
     req.write(
       JSON.stringify({
         mode: "chat",
-        model: "",
+        model: model,
         action: "next",
         userAction: "chat",
         requestId: util.uuid(false),
@@ -373,7 +373,7 @@ async function createCompletionStream(
       } else {
         logger.info(`[会话清理] 保留引用会话: ${refSessionId}`);
       }
-    });
+    }, model);
   })().catch((err) => {
     session && session.close();
     if (retryCount < MAX_RETRY_COUNT) {
@@ -419,7 +419,7 @@ async function generateImages(
     req.write(
       JSON.stringify({
         mode: "chat",
-        model: "",
+        model: model,
         action: "next",
         userAction: "chat",
         requestId: util.uuid(false),
@@ -742,12 +742,12 @@ function checkResult(result: AxiosResponse) {
  * @param stream 消息流
  * @param hasTools 是否有工具调用
  */
-async function receiveStream(stream: any, hasTools = false): Promise<any> {
+async function receiveStream(stream: any, hasTools = false, model = MODEL_NAME): Promise<any> {
   return new Promise((resolve, reject) => {
     // 消息初始化
     const data = {
       id: "",
-      model: MODEL_NAME,
+      model: model,
       object: "chat.completion",
       choices: [
         {
@@ -880,7 +880,7 @@ async function receiveStream(stream: any, hasTools = false): Promise<any> {
  * @param hasTools 是否有工具调用
  * @param endCallback 传输结束回调
  */
-function createTransStream(stream: any, hasTools = false, endCallback?: Function) {
+function createTransStream(stream: any, hasTools = false, endCallback?: Function, model = MODEL_NAME) {
   // 消息创建时间
   const created = util.unixTimestamp();
   // 创建转换流
@@ -895,7 +895,7 @@ function createTransStream(stream: any, hasTools = false, endCallback?: Function
     transStream.write(
       `data: ${JSON.stringify({
         id: "",
-        model: MODEL_NAME,
+        model: model,
         object: "chat.completion.chunk",
         choices: [
           {
@@ -969,7 +969,7 @@ function createTransStream(stream: any, hasTools = false, endCallback?: Function
                   // 发送工具调用
                   transStream.write(`data: ${JSON.stringify({
                     id: `${result.sessionId}-${result.msgId}`,
-                    model: MODEL_NAME,
+                    model: model,
                     object: "chat.completion.chunk",
                     choices: [
                       {
@@ -1003,7 +1003,7 @@ function createTransStream(stream: any, hasTools = false, endCallback?: Function
           
           const data = `data: ${JSON.stringify({
             id: `${result.sessionId}-${result.msgId}`,
-            model: MODEL_NAME,
+            model: model,
             object: "chat.completion.chunk",
             choices: [
               { index: 0, delta: { content: chunk }, finish_reason: null },
@@ -1037,7 +1037,7 @@ function createTransStream(stream: any, hasTools = false, endCallback?: Function
                 // 发送工具调用
                 transStream.write(`data: ${JSON.stringify({
                   id: `${result.sessionId}-${result.msgId}`,
-                  model: MODEL_NAME,
+                  model: model,
                   object: "chat.completion.chunk",
                   choices: [
                     {
@@ -1075,7 +1075,7 @@ function createTransStream(stream: any, hasTools = false, endCallback?: Function
           delta.content += `服务暂时不可用，第三方响应错误：${result.errorCode}`;
         const data = `data: ${JSON.stringify({
           id: `${result.sessionId}-${result.msgId}`,
-          model: MODEL_NAME,
+          model: model,
           object: "chat.completion.chunk",
           choices: [
             {
